@@ -1,0 +1,187 @@
+---
+title: "| Big Data Analysis \n| Machine Learning Basics and CART \n"
+author: "Marcel Neunhoeffer - University of Mannheim"
+date: "June 03 2019"
+output:
+  html_notebook:
+    toc: yes
+  html_document: default
+  pdf_document: default
+  word_document:
+    toc: yes
+---
+
+# Setup
+
+## Loading and installing packages
+```{r setup, echo=FALSE, include=FALSE}
+# Load the packages we need for this tutorial. Install them if needed.
+p_needed <-
+  c(
+    "ggplot2",
+    "ggmap",
+    "GGally",
+    "rpart",
+    "reshape2",
+    "partykit",
+    "pdp",
+    "caret"
+  )
+packages <- rownames(installed.packages())
+p_to_install <- p_needed[!(p_needed %in% packages)]
+if (length(p_to_install) > 0) {
+  install.packages(p_to_install)
+}
+sapply(p_needed, require, character.only = TRUE)
+```
+
+## Loading the data into the working environment
+```{r Load the data}
+load("immofr.Rda")
+```
+
+# Data preparation
+
+In this notebook we use data from immobilienscout24.de on apartments for rent in Frankfurt. The data was gathered (scraped) in March 2019. As a first step, we can run `summary()` to get a general overview about the variables in this dataset.
+
+```{r Quick Summary}
+summary(fr_immo)
+```
+
+Next, we split the data into a train and test part. Here we use `sample()` to prepare a 80 to 20 percent split.
+
+```{r Train/Test Split I}
+set.seed(06032019)
+train <- sample(1:nrow(fr_immo), 0.8*nrow(fr_immo))
+```
+
+The resulting object gives us the row positions of the sampled elements. We use these positions to split the data into two pieces.
+
+```{r Train/Test Split II}
+fr_test <- fr_immo[-train,]
+fr_train <- fr_immo[train,]
+```
+
+We might want to further explore the training set using graphs. Here is a plot using `ggpairs()` from the `GGally` package.
+
+```{r Visual Inspection, message = FALSE, warning = FALSE, results = "hide", fig.align = "center"}
+ggpairs(fr_train[, c(2:4,20)], lower = list(continuous = "smooth"))
+```
+
+In addition, the `ggmap` package can be used to plot the rent prices in Frankfurt on a map.
+
+```{r Plotting on a map, message = FALSE}
+# Draw a box of gps coordinates around the area you want to plot
+bbox <- c(left = 8.593374, bottom = 50.075152, right = 8.738256, top = 50.173762)
+# Get the map
+map <- get_stamenmap(bbox = bbox, zoom = 12, maptype = "toner-hybrid")
+# Plot the map
+ggmap(map)
+# Add information to the map
+ggmap(map) + 
+  geom_point(data = fr_train, aes(x = lon, y = lat, color = rent), size = 2, alpha = 0.5) +
+  scale_color_gradientn(colours = rev(heat.colors(10))) 
+```
+
+# Grow and prune tree
+
+Our task is to predict rent using $m^2$, rooms, location and distance to city center as features. In order to grow a regression tree, `rpart` is used here, which is an implementation of the CART idea. 
+
+```{r First CART}
+set.seed(06032019)
+f_tree <- rpart(rent ~ m2 + rooms + lon + lat + dist_to_center, 
+                data = fr_train, 
+                cp = 0.002)
+f_tree
+```
+
+Given the grown tree, `printcp()` and `plotcp()` help us to determine the best subtree, whereas `Root node error` times `xerror` gives us the estimated test error for each subtree based on cross-validation. 
+
+```{r Finding the best subtree I, fig.align = "center"}
+printcp(f_tree)
+plotcp(f_tree)
+```
+
+On this basis, we are interested in picking the cp value that is associated with the smallest CV error. We could do this by hand or by using a few lines of code.
+
+```{r Finding the best subtree II}
+minx <- which.min(f_tree$cptable[,"xerror"])
+mincp <- f_tree$cptable[minx,"CP"]
+mincp
+```
+
+Alternatively, we could also pick the best subtree based on the 1-SE rule. We are again interested in storing the corresponding cp value for tree pruning in the next step.
+
+```{r Finding the best subtree III}
+minx <- which.min(f_tree$cptable[,"xerror"])
+minxse <- f_tree$cptable[minx,"xerror"] + f_tree$cptable[minx,"xstd"]
+minse <- which(f_tree$cptable[1:minx,"xerror"] < minxse)
+mincp2 <- f_tree$cptable[minse[1],"CP"]
+mincp2
+```
+
+Now we can get the best subtree with the prune function. First based on the smallest CV error...
+
+```{r Prune to the best subtree I}
+p_tree <- prune(f_tree, cp = mincp)
+p_tree
+```
+
+...and now based on the 1-SE rule.
+
+```{r Prune to the best subtree II}
+p_tree2 <- prune(f_tree, cp = mincp2)
+p_tree2
+```
+
+# Plots
+
+An advantage of trees is that they can be easily interpreted by a simple plot. The `party` package produces nice tree plots.
+
+```{r Looking at the tree I, fig.align="center"}
+prty_tree <- as.party(p_tree)
+plot(prty_tree, gp = gpar(fontsize = 6))
+```
+
+Here we plot the smaller tree, which was pruned based on the 1SE rule. 
+
+```{r Looking at the tree II, fig.align="center"}
+prty_tree2 <- as.party(p_tree2)
+plot(prty_tree2)
+```
+
+If we are interested in the prediction surface of a tree, partial dependence plots using e.g. the `pdp` package can be useful.
+
+```{r Partial Dependence I, fig.align="center"}
+pdp1 <- partial(p_tree, pred.var = "m2")
+plotPartial(pdp1, rug = T, train = fr_train, alpha = 0.3)
+```
+
+The `pdp` package also allows to plot prediction surfaces based on two predictors.
+
+```{r Partial Dependence II, fig.align="center"}
+pdp2 <- partial(p_tree, pred.var = c("m2", "dist_to_center"))
+plotPartial(pdp2, levelplot = F, drape = T, colorkey = F, screen = list(z = 40, x = -60))
+```
+
+# Prediction
+
+Finally, we can use the pruned trees in order to predict the outcome in the holdout (test) set.
+
+```{r Prediction}
+y_tree <- predict(p_tree, newdata = fr_test)
+y_tree2 <- predict(p_tree2, newdata = fr_test)
+```
+
+`RMSE()` and `R2()` can be used to produce basic performance measures.
+
+```{r Performance Measures on the test set}
+RMSE(pred = y_tree, obs = fr_test$rent, na.rm = TRUE)
+R2(pred = y_tree, obs = fr_test$rent, na.rm = TRUE)
+RMSE(pred = y_tree2, obs = fr_test$rent, na.rm = TRUE)
+R2(pred = y_tree2, obs = fr_test$rent, na.rm = TRUE)
+```
+
+## References
+
+* https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf
